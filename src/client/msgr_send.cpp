@@ -17,8 +17,8 @@
 
 #define GCM_TMP_BUF_SIZE 4096
 
-// How many times to retry sendmsg() in place before falling back to EPOLLOUT.
-// Only used with use_sync_send_recv - io_uring waits for the socket by itself
+// How many times to retry a blocking-style sendmsg() before waiting for EPOLLOUT.
+// The io_uring path submits once, then waits for EPOLLOUT after EAGAIN.
 #define MSGR_SEND_RETRIES 4
 
 class msgr_op_writer_t
@@ -506,6 +506,12 @@ restart:
     {
         return true;
     }
+    if (!cl->write_ready)
+    {
+        // Socket buffer is full, the unsent tail is still in send_list.
+        // Do not copy more data into it, just wait for EPOLLOUT
+        return true;
+    }
     if (!use_sync_send_recv)
     {
         if (!ringloop->space_left())
@@ -519,14 +525,11 @@ restart:
             return true;
         }
     }
-    else if (!cl->write_ready)
-    {
-        // Socket buffer is full, the unsent tail is still in send_list.
-        // Do not copy more data into it, just wait for EPOLLOUT
-        return true;
-    }
+    // A short send left its tail in send_list. Finish that tail before
+    // appending new ops, and do not zerocopy it (see handle_send).
+    bool resume_plain_tail = cl->send_plain_tail && cl->send_list.size();
     uint64_t send_free_from = cl->next_send_free + cl->send_free.size();
-    if (cl->hs)
+    if (!resume_plain_tail && cl->hs)
     {
         // Send handshake message
         if (cl->hs->out_size())
@@ -544,12 +547,14 @@ restart:
             goto copy_ops;
         }
     }
-    else
+    else if (!resume_plain_tail)
     {
 copy_ops:
         copy_ops_to_with<get_op_writer_t>(cl, NULL, 0);
     }
     uint64_t send_free_to = cl->next_send_free + cl->send_free.size();
+    // The tail resend owns no send_free entries, handle_send relies on it
+    assert(!resume_plain_tail || send_free_from == send_free_to);
     if (cl->io_error)
     {
         stop_client(cl->client_id);
@@ -586,7 +591,7 @@ copy_ops:
         {
             handle_send(data->res, data->prev, data->more, cl, send_free_from, send_free_to);
         };
-        bool use_zc = has_sendmsg_zc && min_zerocopy_send_size >= 0;
+        bool use_zc = !cl->send_plain_tail && has_sendmsg_zc && min_zerocopy_send_size >= 0;
         if (use_zc && min_zerocopy_send_size > 0 &&
             cl->send_list_size/cl->write_msg.msg_iovlen < min_zerocopy_send_size)
         {
@@ -626,6 +631,10 @@ copy_ops:
             if (cl->send_list.size() && --send_retries <= 0)
             {
                 cl->write_ready = false;
+                tfd->set_fd_handler(cl->peer_fd, true, [this](int peer_fd, int epoll_events)
+                {
+                    handle_peer_epoll(peer_fd, epoll_events);
+                });
                 return true;
             }
         }
@@ -769,11 +778,25 @@ bool osd_messenger_t::handle_send(int result, bool prev, bool more, osd_client_t
         stop_client(cl->client_id);
         return false;
     }
+    // EAGAIN queued nothing. EINTR is resent immediately; EAGAIN waits for EPOLLOUT
+    // so a full send buffer cannot spin the ring thread.
+    bool uring_eagain = !use_sync_send_recv && !prev && result == -EAGAIN;
+    bool uring_retry = uring_eagain || (!use_sync_send_recv && !prev && result == -EINTR);
+    if (uring_retry)
+    {
+        result = 0;
+    }
     if (result >= 0)
     {
         if (prev)
         {
             // Second (zero-copy release) notification
+            if (cl->send_plain_tail && free_from == cl->send_tail_from && free_to == cl->send_tail_to)
+            {
+                // The unsent tail still points into these buffers, release them after it's sent
+                cl->send_tail_zc_pending = false;
+                return true;
+            }
             cl->unref_send_free(free_from, free_to);
             return true;
         }
@@ -781,13 +804,56 @@ bool osd_messenger_t::handle_send(int result, bool prev, bool more, osd_client_t
         {
             cl->send_list.clear();
             cl->send_list_size = 0;
+            if (cl->send_plain_tail)
+            {
+                cl->send_plain_tail = false;
+                // Otherwise the zerocopy notification releases it through the common path
+                if (!cl->send_tail_zc_pending)
+                    cl->unref_send_free(cl->send_tail_from, cl->send_tail_to);
+            }
         }
         else if (!use_sync_send_recv)
         {
-            fprintf(stderr, "Client %ju socket write error: expected to send "
-                "%zu bytes with MSG_WAITALL but sent %u. Disconnecting client\n", cl->client_id, cl->send_list_size, result);
-            stop_client(cl->client_id);
-            return false;
+            // io_uring may still return a short write for MSG_WAITALL (depending on the
+            // kernel version or when interrupted), for example with large SEC_LIST replies
+            // filling the socket buffer. Keep the zerocopy prefix and resend only the tail
+            // with a copying sendmsg.
+            if (result <= 0 && !uring_retry)
+            {
+                fprintf(stderr, "Client %ju socket write error: expected to send "
+                    "%zu bytes with MSG_WAITALL but sent %u. Disconnecting client\n", cl->client_id, cl->send_list_size, result);
+                stop_client(cl->client_id);
+                return false;
+            }
+            if (!cl->send_plain_tail)
+            {
+                // First short write of the original batch. Repeated short writes of
+                // the tail itself own no send_free entries and must not overwrite it.
+                cl->send_tail_from = free_from;
+                cl->send_tail_to = free_to;
+                cl->send_tail_zc_pending = more;
+            }
+            eat_send_list(cl, result);
+            cl->send_list_size -= result;
+            cl->send_plain_tail = true;
+            if (uring_eagain)
+            {
+                cl->write_ready = false;
+                tfd->set_fd_handler(cl->peer_fd, true, [this](int peer_fd, int epoll_events)
+                {
+                    handle_peer_epoll(peer_fd, epoll_events);
+                });
+                return true;
+            }
+            // A positive short write made progress. Submit the tail once;
+            // if that also returns EAGAIN, the branch above waits for EPOLLOUT.
+            if (cl->write_state == 0)
+            {
+                cl->write_state = CL_WRITE_READY;
+                write_ready_clients.push_back(cl->client_id);
+            }
+            ringloop->wakeup();
+            return true;
         }
         else
         {

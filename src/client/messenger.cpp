@@ -506,8 +506,8 @@ void osd_messenger_t::handle_connect_epoll(int peer_fd)
     int one = 1;
     setsockopt(peer_fd, SOL_TCP, TCP_NODELAY, &one, sizeof(one));
     cl->peer_state = PEER_CONNECTED;
-    // EPOLLOUT is only required without io_uring, to continue partially sent messages
-    tfd->set_fd_handler(peer_fd, use_sync_send_recv, [this](int peer_fd, int epoll_events)
+    // EPOLLOUT is registered on demand when a send returns EAGAIN
+    tfd->set_fd_handler(peer_fd, false, [this](int peer_fd, int epoll_events)
     {
         handle_peer_epoll(peer_fd, epoll_events);
     });
@@ -547,7 +547,7 @@ void osd_messenger_t::handle_peer_epoll(int peer_fd, int epoll_events)
     }
     if (epoll_events & EPOLLOUT)
     {
-        // The socket became writable again - continue the interrupted use_sync_send_recv
+        // The socket became writable again - continue the interrupted send
         // read_requests() above may have stopped the client, so look it up again
         auto cl_it = clients.find(cl->client_id);
         if (cl_it == clients.end())
@@ -555,11 +555,28 @@ void osd_messenger_t::handle_peer_epoll(int peer_fd, int epoll_events)
             return;
         }
         cl = cl_it->second;
-        cl->write_ready = true;
-        // send_list is only left non-empty when we're waiting for EPOLLOUT
-        if (cl->send_list.size() && cl->peer_state != PEER_RDMA)
+        if (!cl->write_ready)
         {
-            try_send(cl);
+            cl->write_ready = true;
+            tfd->set_fd_handler(peer_fd, false, [this](int peer_fd, int epoll_events)
+            {
+                handle_peer_epoll(peer_fd, epoll_events);
+            });
+        }
+        if (cl->peer_state != PEER_RDMA &&
+            (use_sync_send_recv ? cl->send_list.size() > 0 :
+                (cl->send_plain_tail && !cl->write_msg.msg_iovlen ||
+                    cl->write_op || cl->write_ops.size() || cl->hs && cl->hs->out_size())))
+        {
+            if (use_sync_send_recv)
+                try_send(cl);
+            else if (cl->write_state == 0)
+            {
+                cl->write_state = CL_WRITE_READY;
+                write_ready_clients.push_back(cl->client_id);
+                if (ringloop)
+                    ringloop->wakeup();
+            }
         }
     }
 }
@@ -797,8 +814,8 @@ void osd_messenger_t::accept_connections(int listen_fd)
         {
             continue;
         }
-        // Add FD to epoll. EPOLLOUT is only required without io_uring
-        tfd->set_fd_handler(peer_fd, use_sync_send_recv, [this](int peer_fd, int epoll_events)
+        // EPOLLOUT is registered on demand when a send returns EAGAIN
+        tfd->set_fd_handler(peer_fd, false, [this](int peer_fd, int epoll_events)
         {
             handle_peer_epoll(peer_fd, epoll_events);
         });

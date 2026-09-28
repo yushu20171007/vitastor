@@ -154,10 +154,19 @@ struct osd_client_t
     size_t write_op_pos = 0;
     msghdr write_msg = { 0 };
     int write_state = 0;
-    // Socket is writable. Only tracked with use_sync_send_recv, io_uring doesn't need it
+    // Socket is writable. Cleared when a send returns EAGAIN; EPOLLOUT sets it again.
     bool write_ready = true;
     std::vector<iovec> send_list;
     size_t send_list_size = 0;
+    // Remainder of a short io_uring send. Resent without zerocopy so the
+    // already accepted prefix can stay on the zerocopy path.
+    bool send_plain_tail = false;
+    // The tail points into send_free[send_tail_from..send_tail_to) of the batch
+    // that was short-written. That range is released only after both the tail
+    // is fully sent and, if it was a zerocopy send, its release notification arrives.
+    bool send_tail_zc_pending = false;
+    uint64_t send_tail_from = 0;
+    uint64_t send_tail_to = 0;
     uint64_t next_send_free = 0;
     std::deque<msgr_sendp_t> send_free;
     op_aes_xts_encrypt_t *xts_enc_ctx = NULL;
